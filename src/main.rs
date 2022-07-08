@@ -1,9 +1,9 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{BufReader, Seek, Write};
+use std::io::{stdout, BufReader, Seek, Write};
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use xmltree::{Element, EmitterConfig, XMLNode};
 use zip::read::ZipFile;
 use zip::write::FileOptions;
@@ -11,7 +11,22 @@ use zip::{ZipArchive, ZipWriter};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
-struct Args {
+#[clap(propagate_version = true)]
+struct Cli {
+    #[clap(subcommand)]
+    subcommand: Subcommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Subcommands {
+    /// Add metadata to 3MF files
+    Add(Add),
+    /// Show metadata in 3MF files
+    Show(Show),
+}
+
+#[derive(Args, Debug)]
+struct Add {
     /// Prefix for output filename
     #[clap(short, long, default_value = "_licensed")]
     suffix: String,
@@ -26,7 +41,22 @@ struct Args {
 
     /// Input file(s)
     #[clap(forbid_empty_values = true, required = true)]
-    input: Vec<OsString>,
+    input_files: Vec<OsString>,
+
+    // output file is just used internally for add commands
+    #[clap(skip)]
+    output_path: Option<PathBuf>,
+
+    // metadata read from file, also internal only
+    #[clap(skip)]
+    metadata_xml: Option<Element>,
+}
+
+#[derive(Args, Debug)]
+struct Show {
+    /// Input file(s)
+    #[clap(forbid_empty_values = true, required = true)]
+    input_files: Vec<OsString>,
 }
 
 fn update_xml_and_copy<W>(mut file: ZipFile, metadata: &Element, output: &mut ZipWriter<W>)
@@ -43,7 +73,7 @@ where
         XMLNode::Element(element) => element.name == "metadata",
         _ => false,
     }) {
-        println!("Metadata found in file {}, not adding any", file_name);
+        eprintln!("Metadata found in file {}, not adding any", file_name);
         // do a raw copy instead
         output
             .raw_copy_file(file)
@@ -66,39 +96,83 @@ where
         .indent_string("\t")
         .line_separator("\n");
     xml.write_with_config(output, config).unwrap();
-    println!("Added metadata to file {}", file_name);
+    eprintln!("Added metadata to file {}", file_name);
+}
+
+fn show_metadata(file: ZipFile) {
+    // Like above, should not fail
+    let file_name: String = file.enclosed_name().unwrap().to_str().unwrap().to_string();
+
+    let xml = Element::parse(file).unwrap();
+    let metadata = xml
+        .children
+        .into_iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(mut element) => {
+                if element.name == "metadata" {
+                    element.namespace = None;
+                    element.namespaces = None;
+                    Some(element)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if metadata.is_empty() {
+        eprintln!("No metadata found in file {}", file_name);
+    } else {
+        eprintln!("Metadata found in file {}:", file_name);
+        let config = EmitterConfig::new()
+            .perform_indent(true)
+            .indent_string("\t")
+            .line_separator("\n")
+            .write_document_declaration(false);
+        for element in metadata {
+            element.write_with_config(stdout(), config.clone()).unwrap();
+            println!();
+        }
+    }
 }
 
 fn main() {
-    let args = Args::parse();
-    //println!("{:?}", args);
+    let mut cli = Cli::parse();
+    //eprintln!("{:?}", args);
 
-    // read metadata file
-    let metadata = BufReader::new(File::open(&args.metadata).unwrap());
-    let metadata =
-        Element::parse(metadata).unwrap_or_else(|_| panic!("Could not parse metadata file"));
-    if metadata.name != "v1" {
-        println!("Metadata file is not a v1 file");
-        std::process::exit(1);
+    if let Subcommands::Add(ref mut add) = cli.subcommand {
+        // read metadata file
+        let metadata = BufReader::new(File::open(&add.metadata).unwrap());
+        let metadata =
+            Element::parse(metadata).unwrap_or_else(|_| panic!("Could not parse metadata file"));
+        if metadata.name != "v1" {
+            eprintln!("Metadata file is not a v1 file");
+            std::process::exit(1);
+        }
+        if metadata.children.iter().any(|child| match child {
+            XMLNode::Element(element) => element.name != "metadata",
+            _ => true,
+        }) {
+            eprintln!("Metadata file contains XML elements other than v1 and its metadata children");
+            std::process::exit(1);
+        }
+        if !metadata.children.iter().any(|child| match child {
+            XMLNode::Element(element) => element.name == "metadata",
+            _ => false,
+        }) {
+            eprintln!("Metadata file has no metadata elements");
+            std::process::exit(1);
+        }
+        add.metadata_xml = Some(metadata);
     }
-    if metadata.children.iter().any(|child| match child {
-        XMLNode::Element(element) => element.name != "metadata",
-        _ => true,
-    }) {
-        println!("Metadata file contains XML elements other than v1 and its metadata children");
-        std::process::exit(1);
-    }
-    if !metadata.children.iter().any(|child| match child {
-        XMLNode::Element(element) => element.name == "metadata",
-        _ => false,
-    }) {
-        println!("Metadata file has no metadata elements");
-        std::process::exit(1);
-    }
+
+    let input_files = match cli.subcommand {
+        Subcommands::Add(ref add) => &add.input_files,
+        Subcommands::Show(ref show) => &show.input_files,
+    };
 
     #[cfg(windows)]
-    let input_file_names = args
-        .input
+    let expanded_input_files = input_files
         .into_iter()
         .flat_map(|file_name| {
             if let Some(file_name) = file_name.to_str() {
@@ -107,91 +181,110 @@ fn main() {
                     .map(|path| path.unwrap())
                     .collect::<Vec<_>>()
             } else {
-                println!("Using file {} as is", file_name.to_string_lossy());
                 vec![PathBuf::from(file_name)]
             }
         })
         .collect::<Vec<_>>();
 
     #[cfg(not(windows))]
-    let input_file_names = args
-        .input
+    let input_file_names = input_files
         .into_iter()
         .map(|file_name| PathBuf::from(file_name))
         .collect::<Vec<_>>();
 
-    println!("Number of input files: {}", input_file_names.len());
+    eprintln!("Number of input files: {}", expanded_input_files.len());
     // loop over input files, exit with an error if any input
     // file starts with our prefix, or don't exist.
-    for input_path in &input_file_names {
-        println!("Processing {}", input_path.to_string_lossy());
+    for input_path in &expanded_input_files {
+        eprintln!("Processing {}", input_path.to_string_lossy());
         if !input_path.exists() {
-            println!("{} does not exist", input_path.to_string_lossy());
+            eprintln!("{} does not exist", input_path.to_string_lossy());
             std::process::exit(1);
         }
         if !input_path.is_file() {
-            println!("{} is not a file", input_path.to_string_lossy());
+            eprintln!("{} is not a file", input_path.to_string_lossy());
             std::process::exit(1);
         }
-        let output_file_name;
-        if let (Some(stem), extension) = (input_path.file_stem(), input_path.extension()) {
-            if stem.to_string_lossy().ends_with(&args.suffix) {
-                println!(
-                    "Skipping {}, because it already ends with suffix, exiting",
-                    input_path.display()
+        if let Subcommands::Add(ref mut add) = cli.subcommand {
+            let output_file_name;
+            if let (Some(stem), extension) = (input_path.file_stem(), input_path.extension()) {
+                if stem.to_string_lossy().ends_with(&add.suffix) {
+                    eprintln!(
+                        "Skipping {}, because it already ends with suffix, exiting",
+                        input_path.display()
+                    );
+                    continue;
+                }
+                let mut name = stem.to_os_string();
+                name.push(OsStr::new(&add.suffix));
+                if let Some(extension) = extension {
+                    name.push(OsString::from("."));
+                    name.push(extension);
+                }
+                output_file_name = Some(name);
+            } else {
+                panic!("Could not get file stem from {}", input_path.display());
+            }
+            // Shouldn't fail because of the panic above
+            let output_file_name = output_file_name.unwrap();
+            let output_path = input_path.with_file_name(output_file_name);
+
+            if output_path.exists() && !add.force {
+                eprintln!(
+                    "{} already exists, use -f or --force to ignore",
+                    output_path.to_string_lossy()
                 );
-                continue;
+                std::process::exit(1);
             }
-            let mut name = stem.to_os_string();
-            name.push(OsStr::new(&args.suffix));
-            if let Some(extension) = extension {
-                name.push(OsString::from("."));
-                name.push(extension);
-            }
-            output_file_name = Some(name);
-        } else {
-            panic!("Could not get file stem from {}", input_path.display());
+            add.output_path = Some(output_path);
         }
-        // Shouldn't fail because of the panic above
-        let output_file_name = output_file_name.unwrap();
-        let output_path = input_path.with_file_name(output_file_name);
-
-        if output_path.exists() && !args.force {
-            println!(
-                "{} already exists, use -f or --force to ignore",
-                output_path.to_string_lossy()
-            );
-            std::process::exit(1);
-        }
-
         // open input file
         let input = File::open(input_path).unwrap_or_else(|_| {
             panic!("Failed to open input file {}", input_path.to_string_lossy())
         });
         let input = BufReader::new(input);
         let mut input = ZipArchive::new(input).unwrap();
-        // open output file
-        let output = File::create(&output_path).unwrap_or_else(|_| {
-            panic!(
-                "Failed to open output file {}",
-                output_path.to_string_lossy()
-            )
-        });
-        let mut output = ZipWriter::new(output);
-        // copy all files from input to output
-        for file_number in 0..input.len() {
-            let file = input
-                .by_index(file_number)
-                .expect("failure reading from ZIP archive");
-            match file.enclosed_name() {
-                Some(path) if path.extension() == Some(OsStr::new("model")) => {
-                    update_xml_and_copy(file, &metadata, &mut output)
+
+        match cli.subcommand {
+            Subcommands::Add(ref add) => {
+                // open output file
+                let output_path = add.output_path.as_ref().unwrap();
+                let output = File::create(output_path).unwrap_or_else(|_| {
+                    panic!(
+                        "Failed to open output file {}",
+                        output_path.to_string_lossy()
+                    )
+                });
+                let mut output = ZipWriter::new(output);
+                // copy all files from input to output
+                for file_number in 0..input.len() {
+                    let file = input
+                        .by_index(file_number)
+                        .expect("failure reading from ZIP archive");
+                    match file.enclosed_name() {
+                        Some(path) if path.extension() == Some(OsStr::new("model")) => {
+                            update_xml_and_copy(file, add.metadata_xml.as_ref().unwrap(), &mut output)
+                        }
+                        _ => output.raw_copy_file(file).expect("writing raw copy failed"),
+                    };
                 }
-                _ => output.raw_copy_file(file).expect("writing raw copy failed"),
-            };
+                output
+                    .finish()
+                    .expect("failed to finish writing ZIP archive");
+            }
+            Subcommands::Show(_) => {
+                for file_number in 0..input.len() {
+                    let file = input
+                        .by_index(file_number)
+                        .expect("failure reading from ZIP archive");
+                    match file.enclosed_name() {
+                        Some(path) if path.extension() == Some(OsStr::new("model")) => {
+                            show_metadata(file)
+                        }
+                        _ => (),
+                    };
+                }
+            }
         }
-        output
-            .finish()
-            .expect("failed to finish writing ZIP archive");
     }
 }
