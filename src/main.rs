@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufReader, Seek, Write};
-use std::path::Path;
+use std::path::PathBuf;
 
 use clap::Parser;
 use xmltree::{Element, EmitterConfig, XMLNode};
@@ -13,8 +13,8 @@ use zip::{ZipArchive, ZipWriter};
 #[clap(author, version, about, long_about = None)]
 struct Args {
     /// Prefix for output filename
-    #[clap(short, long, default_value = "BASt_")]
-    prefix: String,
+    #[clap(short, long, default_value = "_licensed")]
+    suffix: String,
 
     /// File containing the metadata to be added to the 3MF
     #[clap(short, long, default_value = "metadata.xml")]
@@ -45,7 +45,9 @@ where
     }) {
         println!("Metadata found in file {}, not adding any", file_name);
         // do a raw copy instead
-        output.raw_copy_file(file).unwrap_or_else(|_| panic!("writing raw copy failed"));
+        output
+            .raw_copy_file(file)
+            .unwrap_or_else(|_| panic!("writing raw copy failed"));
         return;
     }
     // clone metadata's children to a new Vec
@@ -73,7 +75,8 @@ fn main() {
 
     // read metadata file
     let metadata = BufReader::new(File::open(&args.metadata).unwrap());
-    let metadata = Element::parse(metadata).unwrap_or_else(|_| panic!("Could not parse metadata file"));
+    let metadata =
+        Element::parse(metadata).unwrap_or_else(|_| panic!("Could not parse metadata file"));
     if metadata.name != "v1" {
         println!("Metadata file is not a v1 file");
         std::process::exit(1);
@@ -93,30 +96,64 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!("Number of input files: {}", args.input.len());
+    #[cfg(windows)]
+    let input_file_names = args
+        .input
+        .into_iter()
+        .flat_map(|file_name| {
+            if let Some(file_name) = file_name.to_str() {
+                glob::glob(file_name)
+                    .unwrap_or_else(|_| panic!("Could not glob {}", file_name))
+                    .map(|path| path.unwrap())
+                    .collect::<Vec<_>>()
+            } else {
+                println!("Using file {} as is", file_name.to_string_lossy());
+                vec![PathBuf::from(file_name)]
+            }
+        })
+        .collect::<Vec<_>>();
+
+    #[cfg(not(windows))]
+    let input_file_names = args
+        .input
+        .into_iter()
+        .map(|file_name| PathBuf::from(file_name))
+        .collect::<Vec<_>>();
+
+    println!("Number of input files: {}", input_file_names.len());
     // loop over input files, exit with an error if any input
     // file starts with our prefix, or don't exist.
-    for input in &args.input {
-        if input.to_string_lossy().starts_with(&args.prefix) {
-            println!(
-                "Skipping {}, because it already starts with prefix {}",
-                input.to_string_lossy(),
-                args.prefix
-            );
-            continue;
-        }
-        let input_path = Path::new(input);
+    for input_path in &input_file_names {
+        println!("Processing {}", input_path.to_string_lossy());
         if !input_path.exists() {
-            println!("{} does not exist", input.to_string_lossy());
+            println!("{} does not exist", input_path.to_string_lossy());
             std::process::exit(1);
         }
         if !input_path.is_file() {
-            println!("{} is not a file", input.to_string_lossy());
+            println!("{} is not a file", input_path.to_string_lossy());
             std::process::exit(1);
         }
-        // add prefix to file name
-        let mut output_file_name = OsString::from(&args.prefix);
-        output_file_name.push(input_path.file_name().unwrap());
+        let output_file_name;
+        if let (Some(stem), extension) = (input_path.file_stem(), input_path.extension()) {
+            if stem.to_string_lossy().ends_with(&args.suffix) {
+                println!(
+                    "Skipping {}, because it already ends with suffix, exiting",
+                    input_path.display()
+                );
+                continue;
+            }
+            let mut name = stem.to_os_string();
+            name.push(OsStr::new(&args.suffix));
+            if let Some(extension) = extension {
+                name.push(OsString::from("."));
+                name.push(extension);
+            }
+            output_file_name = Some(name);
+        } else {
+            panic!("Could not get file stem from {}", input_path.display());
+        }
+        // Shouldn't fail because of the panic above
+        let output_file_name = output_file_name.unwrap();
         let output_path = input_path.with_file_name(output_file_name);
 
         if output_path.exists() && !args.force {
@@ -128,18 +165,18 @@ fn main() {
         }
 
         // open input file
-        let input = File::open(input_path).unwrap_or_else(|_| panic!(
-            "Failed to open input file {}",
-            input.to_string_lossy()
-        ));
+        let input = File::open(input_path).unwrap_or_else(|_| {
+            panic!("Failed to open input file {}", input_path.to_string_lossy())
+        });
         let input = BufReader::new(input);
         let mut input = ZipArchive::new(input).unwrap();
         // open output file
-        let output = File::create(&output_path).unwrap_or_else(|_| panic!(
-            "Failed to open output file {}",
-            output_path.to_string_lossy()
-        ));
-        println!("Processing {}", input_path.to_string_lossy());
+        let output = File::create(&output_path).unwrap_or_else(|_| {
+            panic!(
+                "Failed to open output file {}",
+                output_path.to_string_lossy()
+            )
+        });
         let mut output = ZipWriter::new(output);
         // copy all files from input to output
         for file_number in 0..input.len() {

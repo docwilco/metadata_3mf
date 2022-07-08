@@ -1,11 +1,12 @@
 [package]
 name = "add_metadata_to_3mf"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 clap = { version = "3.2.8", features = ["derive"] }
+glob = "0.3.0"
 xmltree = { version = "0.10.3", features = ["attribute-order"] }
 zip = "0.6.2"
