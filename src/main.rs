@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{stdout, BufReader, Seek, Write};
@@ -35,6 +36,15 @@ struct Add {
     #[clap(short, long, default_value = "metadata.xml")]
     metadata: OsString,
 
+    /// Whether to keep existing metadata tags when one of the same
+    /// name is found in the metadata file.
+    #[clap(short, long)]
+    keep_existing: bool,
+
+    /// Set Title to filename
+    #[clap(short, long)]
+    title: bool,
+
     /// Force overwrite of existing files
     #[clap(short, long)]
     force: bool,
@@ -46,6 +56,10 @@ struct Add {
     // output file is just used internally for add commands
     #[clap(skip)]
     output_path: Option<PathBuf>,
+
+    // title_value is just used internally for add commands
+    #[clap(skip)]
+    title_value: Option<String>,
 
     // metadata read from file, also internal only
     #[clap(skip)]
@@ -59,7 +73,27 @@ struct Show {
     input_files: Vec<OsString>,
 }
 
-fn update_xml_and_copy<W>(mut file: ZipFile, metadata: &Element, output: &mut ZipWriter<W>)
+fn add_metadata_to_hashmap(metadata_map: &mut HashMap<String, XMLNode>, metadata: &Element) {
+    for child in metadata.children.iter() {
+        match child {
+            XMLNode::Element(element) => {
+                metadata_map.insert(
+                    element.attributes["name"].clone(),
+                    XMLNode::Element(element.clone()),
+                );
+            }
+            _ => panic!("metadata element is not an element"),
+        }
+    }
+}
+
+fn update_xml_and_copy<W>(
+    mut file: ZipFile,
+    metadata: &Element,
+    output: &mut ZipWriter<W>,
+    keep_existing: bool,
+    title: &Option<String>,
+) -> bool
 where
     W: Write + Seek,
 {
@@ -69,24 +103,55 @@ where
     let file_name: String = file.enclosed_name().unwrap().to_str().unwrap().to_string();
 
     let mut xml = Element::parse(&mut file).unwrap();
-    if xml.children.iter().any(|child| match child {
-        XMLNode::Element(element) => element.name == "metadata",
-        _ => false,
-    }) {
-        eprintln!("Metadata found in file {}, not adding any", file_name);
-        // do a raw copy instead
-        output
-            .raw_copy_file(file)
-            .unwrap_or_else(|_| panic!("writing raw copy failed"));
-        return;
+
+    // move xml's children to temporary vec.
+    let mut children: Vec<XMLNode> = Vec::new();
+    children.append(&mut xml.children);
+
+    // add all metadata elements in xml to a hashmap, then add the metadata
+    // elements as well, overwriting any existing metadata. Or vice versa
+    // if keep_existing is true.
+    let mut metadata_map: HashMap<String, XMLNode> = HashMap::new();
+    // if we keep the existing metadata, add the new metadata to the map first.
+    if keep_existing {
+        add_metadata_to_hashmap(&mut metadata_map, metadata)
     }
-    // clone metadata's children to a new Vec
-    let mut metadata = metadata.children.to_vec();
-    // metadata needs to be at the start, so we append the existing children to
-    // the metadata Vec, leaving xml.children empty. And then append the whole
-    // thing back.
-    metadata.append(&mut xml.children);
-    xml.children.append(&mut metadata);
+    // put metadata children into the hashmap, add everything else to a vec
+    // to be added to the xml after the metadata.
+    let other_elements: Vec<_> = children
+        .into_iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(element) if element.name == "metadata" => {
+                metadata_map.insert(
+                    element.attributes["name"].clone(),
+                    XMLNode::Element(element),
+                );
+                None
+            }
+            _ => Some(child),
+        })
+        .collect();
+    // if we don't keep the existing metadata, add the new metadata to the map last.
+    if !keep_existing {
+        add_metadata_to_hashmap(&mut metadata_map, metadata)
+    }
+    // Set title if requested
+    if let Some(title) = title {
+        eprintln!("setting title to {}", title);
+        // make a new element with the title
+        let mut title_element = Element::new("metadata");
+        title_element.attributes.insert("name".to_string(), "Title".to_string());
+        title_element.children.push(XMLNode::Text(title.clone()));
+        metadata_map.insert("Title".to_string(), XMLNode::Element(title_element));
+    }
+
+    // now add the hashmap to the xml.
+    for node in metadata_map.into_values() {
+        xml.children.push(node);
+    }
+    // and add the other elements to the xml.
+    xml.children.extend(other_elements);
+
     let options = FileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
         .compression_level(Some(9));
@@ -97,6 +162,7 @@ where
         .line_separator("\n");
     xml.write_with_config(output, config).unwrap();
     eprintln!("Added metadata to file {}", file_name);
+    true
 }
 
 fn show_metadata(file: ZipFile) {
@@ -153,7 +219,9 @@ fn main() {
             XMLNode::Element(element) => element.name != "metadata",
             _ => true,
         }) {
-            eprintln!("Metadata file contains XML elements other than v1 and its metadata children");
+            eprintln!(
+                "Metadata file contains XML elements other than v1 and its metadata children"
+            );
             std::process::exit(1);
         }
         if !metadata.children.iter().any(|child| match child {
@@ -217,6 +285,9 @@ fn main() {
                 }
                 let mut name = stem.to_os_string();
                 name.push(OsStr::new(&add.suffix));
+                if add.title {
+                    add.title_value = Some(name.to_string_lossy().to_string());
+                }
                 if let Some(extension) = extension {
                     name.push(OsString::from("."));
                     name.push(extension);
@@ -261,12 +332,28 @@ fn main() {
                     let file = input
                         .by_index(file_number)
                         .expect("failure reading from ZIP archive");
+                    let mut updated = false;
                     match file.enclosed_name() {
                         Some(path) if path.extension() == Some(OsStr::new("model")) => {
-                            update_xml_and_copy(file, add.metadata_xml.as_ref().unwrap(), &mut output)
+                            updated = update_xml_and_copy(
+                                file,
+                                add.metadata_xml.as_ref().unwrap(),
+                                &mut output,
+                                add.keep_existing,
+                                &add.title_value,
+                            )
                         }
-                        _ => output.raw_copy_file(file).expect("writing raw copy failed"),
-                    };
+                        _ => {
+                            drop(file);
+                        }
+                    }
+
+                    if !updated {
+                        let file = input
+                            .by_index_raw(file_number)
+                            .expect("failure reading from ZIP archive");
+                        output.raw_copy_file(file).expect("writing raw copy failed");
+                    }
                 }
                 output
                     .finish()
