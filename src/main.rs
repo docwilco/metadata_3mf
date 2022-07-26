@@ -19,6 +19,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Subcommands {
     /// Add metadata to 3MF files
     Add(Add),
@@ -241,7 +242,7 @@ fn main() {
 
     #[cfg(windows)]
     let expanded_input_files = input_files
-        .into_iter()
+        .iter()
         .flat_map(|file_name| {
             if let Some(file_name) = file_name.to_str() {
                 glob::glob(file_name)
@@ -255,8 +256,8 @@ fn main() {
         .collect::<Vec<_>>();
 
     #[cfg(not(windows))]
-    let input_file_names = input_files
-        .into_iter()
+    let expanded_input_files = input_files
+        .iter()
         .map(|file_name| PathBuf::from(file_name))
         .collect::<Vec<_>>();
 
